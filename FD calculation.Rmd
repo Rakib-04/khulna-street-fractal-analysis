@@ -1,0 +1,244 @@
+---
+title: "FD calculation"
+author: "Md Rakibuzzaman"
+date: "2026-07-11"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# R library and packages
+
+```{r}
+
+library(tidyverse)
+
+```
+
+## Prepare data frame and calculating FD dimension
+
+```{r}
+
+df <- data.frame(s=c(500,450,400,350,300,250,200,150,100,50),
+                 N=c(228,281,343,432,568,789,1176,1981,4083,13205))
+
+df <- df %>% 
+  mutate(ln_inv_s =log(1/s),
+         ln_N=log(N))
+
+model <- lm(ln_N~ln_inv_s, data = df)
+summary(model)
+
+```
+# Assess confidence interval on the slope and intercept
+
+```{r}
+CI <- confint(model, level = 0.95)
+CI
+```
+
+#Assess residual distribution
+
+```{r}
+
+names(model)
+residuals <- model$residuals
+mean(residuals)
+
+qqnorm(residuals)
+qqline(residuals, col = "red", lwd = 2)
+
+plot(model$fitted.values,
+     residuals,
+     xlab = "Fitted Values",
+     ylab = "Residuals",
+     main = "Residuals vs Fitted values")
+
+abline(h = 0, col = "red", lwd = 2)
+lines(lowess(model$fitted.values, residuals), col = "darkgreen", lwd = 2)
+plot(model)
+
+```
+
+# Calculate RMSE (Root Mean Squared Error)
+
+```{r}
+
+rmse <- sqrt(mean(residuals^2))
+rmse
+
+```
+
+# Plot the residuals values
+
+```{r}
+
+graph <- ggplot(model, aes(x = model$fitted.values, y = model$residuals)) +
+  geom_hline(yintercept = 0, color = "#B22222", linewidth = 0.9, linetype = "solid") +
+  geom_smooth(method = "loess", se = TRUE, color = "#1B7837", 
+              fill = "#1B7837", alpha = 0.15, linewidth = 1, span = 1) +
+  geom_point(shape = 21, size = 3, stroke = 0.8, 
+             fill = "white", color = "black") +
+  labs(
+    title    = "Residuals vs. fitted values",
+    subtitle = "Box-counting regression diagnostic",
+    x        = "Fitted values (ln N(s) predicted)",
+    y        = "Residuals"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 15, hjust = 0),
+    plot.subtitle   = element_text(size = 11, color = "grey30"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.3),
+    axis.title      = element_text(face = "bold"),
+    axis.text       = element_text(color = "black"),
+    panel.border    = element_rect(color = "black", linewidth = 0.6)
+  )
+graph
+
+```
+
+# Apply Local Moran's I (Spatial Weight Matrix (W)- Queen Contiguity) on grid polygon
+
+```{r}
+library(sf)
+library(spdep)
+library(tmap)
+library(tidyverse)
+# setwd()
+
+occupiedPoly <- st_read('localSpatialClustering.shp')
+occupiedPoly <-occupiedPoly %>%
+  rename(mean_FD=mean)
+occupiedPoly <-occupiedPoly %>% 
+  mutate(mean_FD=round(mean_FD,2))
+
+# Run Local Moran's I
+
+nb <- poly2nb(occupiedPoly,queen = FALSE)
+card(nb)
+summary(nb)
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+local <- localmoran(
+          occupiedPoly$mean_FD,
+          lw,
+          zero.policy = TRUE)
+head(local)
+
+# add Z-value, p-value and observed statistics
+
+occupiedPoly$Ii <- local[,1]
+occupiedPoly$Z <- local[,4]
+occupiedPoly$pvalue <- local[,5]
+
+# calculate standardized FD
+
+occupiedPoly$FD_lag <- lag.listw(lw, occupiedPoly$mean_FD, zero.policy = TRUE)
+
+# Standardize FD and its lag (mean-centered)
+occupiedPoly$FD_std <- scale(occupiedPoly$mean_FD)[, 1]
+occupiedPoly$FD_lag_std <- scale(occupiedPoly$FD_lag)[, 1]
+
+# Significance threshold
+sig_level <- 0.05
+
+occupiedPoly <- occupiedPoly %>%
+  mutate(cluster = case_when(
+    pvalue > sig_level                      ~ "Not significant",
+    FD_std > 0 & FD_lag_std > 0            ~ "High-High",
+    FD_std < 0 & FD_lag_std < 0            ~ "Low-Low",
+    FD_std > 0 & FD_lag_std < 0            ~ "High-Low",
+    FD_std < 0 & FD_lag_std > 0            ~ "Low-High",
+    TRUE                                   ~ "Not significant"
+  ))
+
+table(occupiedPoly$cluster)
+ 
+# False Discovery Rate (FDR) correction instead of raw p < 0.05
+occupiedPoly$Pval_fdr <- p.adjust(occupiedPoly$pvalue, method = "fdr")
+occupiedPoly<- occupiedPoly %>%
+  mutate(cluster_fdr = case_when(
+    Pval_fdr > sig_level                   ~ "Not significant",
+    FD_std > 0 & FD_lag_std > 0            ~ "High-High",
+    FD_std < 0 & FD_lag_std < 0            ~ "Low-Low",
+    FD_std > 0 & FD_lag_std < 0            ~ "High-Low",
+    FD_std < 0 & FD_lag_std > 0            ~ "Low-High",
+    TRUE                                   ~ "Not significant"
+  ))
+table(occupiedPoly$cluster_fdr)
+
+# visualise the cluster
+majorRd <- st_read("major_road_networks.shp")
+majorRd <- majorRd %>% 
+  select(-mink_dem)
+majorRd <- majorRd %>% st_transform(crs = 32646)
+
+tmap_mode("plot")
+tm_shape(occupiedPoly) +
+  tm_polygons(
+    col = "cluster",
+    palette = c("High-High" = "#d7191c",
+                "Low-Low" = "#2c7bb6",
+                "Low-High" = "#abd9e9",
+                "High-Low" = "#fdae61",
+                "Not significant" = "grey90"),
+    title = "LISA Cluster",
+    border.col = "grey40",
+    border.alpha = 0.5,
+    lwd = 0.3
+  ) +
+
+  tm_shape(majorRd) +
+  tm_lines(
+    lwd = 1.3,
+    col = "black",
+    lty = "solid"
+  ) +
+  tm_text(
+    text = "Name",
+    size = 0.4,
+    col = "black",
+    shadow = TRUE,
+    auto.placement = TRUE,
+    remove.overlap = TRUE
+  ) +
+
+  tm_layout(
+    main.title = "Local Moran's I Cluster Map",
+    main.title.size = 1,
+    main.title.position = "center",
+    legend.position = c("left", "bottom"),
+    legend.title.size = 0.9,
+    legend.text.size = 0.6,
+    legend.bg.color = "white",
+    legend.bg.alpha = 0.8,
+    legend.frame = FALSE,
+    frame = TRUE,
+    inner.margins = c(0.08, 0.08, 0.08, 0.08)
+  ) +
+
+  tm_scalebar(
+    breaks = c(0, 1, 2, 3),
+    text.size = 0.6,
+    lwd = 0.5,
+    position = c("right", "bottom")
+  ) +
+
+  tm_compass(
+    type = "4star",
+    lwd = 2,
+    size = 2,
+    position = c("right", "top")
+  )
+
+st_write(occupiedPoly, 'localSpatialClustering.shp')
+
+```
+
+
+
